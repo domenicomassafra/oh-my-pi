@@ -10,7 +10,9 @@
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { authPolicyFor } from "@oh-my-pi/pi-catalog/compat/auth";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
+import { getCatalogProviderEntry } from "@oh-my-pi/pi-catalog/provider-models";
 import {
 	type Component,
 	fuzzyRank,
@@ -28,7 +30,7 @@ import { getKnownRoleIds, getRoleInfo, MODEL_ROLE_IDS } from "../../config/model
 import type { Settings } from "../../config/settings";
 import type { ModelPerfStats } from "../../session/agent-storage";
 import { type ConfiguredThinkingLevel, parseConfiguredThinkingLevel } from "../../thinking";
-import { thinkingLevelGlyph as sharedThinkingLevelGlyph } from "../../tools/render-utils";
+import { thinkingLevelGlyph } from "../../tools/render-utils";
 import { type ThemeColor, theme } from "../theme/theme";
 import {
 	matchesSelectCancel,
@@ -317,19 +319,43 @@ function compactModelSearchText(value: string): string {
 	return value.toLowerCase().replace(/[^\p{Letter}\p{Mark}\p{Number}]+/gu, "");
 }
 
-/** Exact id/selector → contiguous literal → fuzzy-only. */
-function modelSearchTier(query: string, item: ModelBrowserItem): number {
-	if (!query) return 2;
-	const id = compactModelSearchText(item.id);
-	const selector = compactModelSearchText(item.selector);
-	if (query === id || query === selector) return 0;
-	if (id.includes(query) || selector.includes(query)) return 1;
-	return 2;
+/** Human provider label from canonical catalog/auth metadata; custom providers may already use a display label as the id. */
+export function modelProviderDisplayName(provider: string): string {
+	return getCatalogProviderEntry(provider)?.catalogDiscovery?.label ?? authPolicyFor(provider)?.name ?? provider;
 }
 
-/** Compact glyph for a configured thinking level using the active theme. */
-export function thinkingLevelGlyph(level: ConfiguredThinkingLevel): string {
-	return sharedThinkingLevelGlyph(level, theme);
+/** Search surface: human names plus every technical identity field, without changing the rendered label. */
+export function modelBrowserSearchText(item: ModelBrowserItem): string {
+	const identity = [
+		item.model.name || item.id,
+		item.id,
+		item.provider,
+		modelProviderDisplayName(item.provider),
+		item.selector,
+	].join(" ");
+	return isFreeModel(item.model) ? `${identity} free` : identity;
+}
+
+/** Exact/contiguous human name or technical identity → fuzzy-only. */
+function modelSearchTier(query: string, item: ModelBrowserItem): number {
+	if (!query) return 2;
+	const name = compactModelSearchText(item.model.name || item.id);
+	const id = compactModelSearchText(item.id);
+	const provider = compactModelSearchText(item.provider);
+	const providerName = compactModelSearchText(modelProviderDisplayName(item.provider));
+	const selector = compactModelSearchText(item.selector);
+	if (query === name || query === id || query === selector) return 0;
+	if (query === provider || query === providerName) return 1;
+	if (
+		name.includes(query) ||
+		id.includes(query) ||
+		provider.includes(query) ||
+		providerName.includes(query) ||
+		selector.includes(query)
+	) {
+		return 1;
+	}
+	return 2;
 }
 
 /**
@@ -347,7 +373,7 @@ export function thinkingLevelGlyph(level: ConfiguredThinkingLevel): string {
 export function formatRoleChip(role: string, assignment: RoleAssignment, settings: Settings): string {
 	const info = getRoleInfo(role, settings);
 	const label = (info.tag ?? info.name ?? role).toLowerCase();
-	const glyph = thinkingLevelGlyph(assignment.thinkingLevel);
+	const glyph = thinkingLevelGlyph(assignment.thinkingLevel, theme);
 	const suffix = glyph ? ` ${theme.fg("dim", glyph)}` : "";
 	if (assignment.autoSelected) {
 		return theme.fg("dim", `${theme.status.shadowed} ${label}`) + suffix;
@@ -428,6 +454,12 @@ function formatTtft(ms: number): string {
 function padLeftVisible(text: string, width: number): string {
 	const missing = width - visibleWidth(text);
 	return missing > 0 ? " ".repeat(missing) + text : text;
+}
+
+/** Pad a plain/styled cell on the right to `width` terminal columns. */
+function padRightVisible(text: string, width: number): string {
+	const missing = width - visibleWidth(text);
+	return missing > 0 ? text + " ".repeat(missing) : text;
 }
 
 /** Behavior switches for {@link ModelBrowser}. */
@@ -576,7 +608,7 @@ export class ModelBrowser implements Component {
 	}
 
 	get visibleCount(): number {
-		return this.#visibleItems.length;
+		return this.#visibleItems.filter(item => !this.#isDisabled(item)).length;
 	}
 
 	/** Move selection to `selector`; false when it is not in the current view. */
@@ -723,10 +755,9 @@ export class ModelBrowser implements Component {
 		const query = this.#searchInput.getValue();
 		let items: ModelBrowserItem[];
 		if (query.trim()) {
-			// Match against the displayed row text so the user can type what
-			// they see: bare names, provider prefixes, scoped queries, and the
-			// cost column's `free` all flow through the same fuzzy matcher.
-			const ranked = fuzzyRank(this.#baseItems, query, modelSearchText);
+			// Search human labels, canonical wire identity, and displayed cost
+			// text without exposing technical selectors as row labels.
+			const ranked = fuzzyRank(this.#baseItems, query, modelBrowserSearchText);
 			const matches = ranked.map(result => result.item);
 			if (this.#preserveQueryOrder) {
 				items = matches;
@@ -908,6 +939,7 @@ export class ModelBrowser implements Component {
 		hovered: boolean,
 		ctxWidth: number,
 		costWidth: number,
+		providerWidth: number,
 		intelligenceWidth: number,
 		perfWidth: number,
 		perfMode: PerfMode,
@@ -919,28 +951,29 @@ export class ModelBrowser implements Component {
 		}
 		const overContext = this.isOverContext(item);
 		const prefix = selected && this.#focused ? `${theme.fg("accent", theme.nav.cursor)} ` : "  ";
-		const providerPrefix = this.#showProvider ? theme.fg("dim", `${item.provider}/`) : "";
-		const name = item.labelColor
-			? theme.fg(item.labelColor, item.id)
-			: selected
-				? theme.fg("accent", item.id)
-				: item.id;
+		const label = item.labelColor ? item.id : item.model.name || item.id;
+		const name = item.labelColor ? theme.fg(item.labelColor, label) : selected ? theme.fg("accent", label) : label;
 		const currentMark =
 			item.selector === this.#currentSelector ? ` ${theme.fg("success", theme.status.enabled)}` : "";
 		const overLimit = overContext
 			? ` ${theme.status.disabled} context>${formatNumber(item.model.contextWindow ?? 0).toLowerCase()}`
 			: "";
-		let left = `${prefix}${providerPrefix}${name}${currentMark}${overLimit}`;
+		let left = `${prefix}${name}${currentMark}${overLimit}`;
 
 		// Metric columns collapse independently when no visible row has data.
+		const providerCol =
+			providerWidth > 0
+				? `${theme.fg("dim", padRightVisible(truncateToWidth(modelProviderDisplayName(item.provider), providerWidth), providerWidth))}  `
+				: "";
 		const intelligenceCol =
 			intelligenceWidth > 0
 				? `${theme.fg("dim", padLeftVisible(formatIntelligence(item.model), intelligenceWidth))}  `
 				: "";
 		const perfCol =
 			perfWidth > 0 ? `${theme.fg("dim", padLeftVisible(this.#perfCell(item, perfMode), perfWidth))}  ` : "";
-		const meta = `${intelligenceCol}${perfCol}${theme.fg("dim", padLeftVisible(formatContext(item.model), ctxWidth))}  ${theme.fg("dim", padLeftVisible(formatCostPair(item.model), costWidth))}`;
+		const meta = `${providerCol}${intelligenceCol}${perfCol}${theme.fg("dim", padLeftVisible(formatContext(item.model), ctxWidth))}  ${theme.fg("dim", padLeftVisible(formatCostPair(item.model), costWidth))}`;
 		const metaWidth =
+			(providerWidth > 0 ? providerWidth + 2 : 0) +
 			ctxWidth +
 			costWidth +
 			2 +
@@ -970,7 +1003,7 @@ export class ModelBrowser implements Component {
 		if (!selected) return ["", ""];
 		const model = selected.model;
 
-		const facts: string[] = [model.name];
+		const facts: string[] = [];
 		// Upstream badges sit next to the name; the provider blurb goes last so
 		// width truncation eats prose before context, cost, or perf facts.
 		if (model.isNew) facts.push("new");
@@ -1043,10 +1076,22 @@ export class ModelBrowser implements Component {
 			lines.push(truncateToWidth(theme.fg("muted", message), width));
 			for (let i = 1; i < this.#maxVisible; i++) lines.push("");
 		} else {
-			// Per-window column widths keep the metadata block aligned without
-			// scanning the entire catalog on every render.
+			// Metric widths follow the visible window. Provider width is stable for
+			// the whole filtered scope so scrolling cannot shift the model column.
 			let ctxWidth = 0;
 			let costWidth = 0;
+			const providerWidth = this.#showProvider
+				? Math.min(
+						Math.max(8, Math.floor(width / 4)),
+						this.#visibleItems.reduce(
+							(max, item) =>
+								this.#isDisabled(item)
+									? max
+									: Math.max(max, visibleWidth(modelProviderDisplayName(item.provider))),
+							0,
+						),
+					)
+				: 0;
 			const perfMode: PerfMode = width >= PERF_FULL_MIN_WIDTH ? "full" : width >= PERF_TPS_MIN_WIDTH ? "tps" : "off";
 			let intelligenceWidth = 0;
 			let perfWidth = 0;
@@ -1073,6 +1118,7 @@ export class ModelBrowser implements Component {
 						i === this.#hoveredIndex,
 						ctxWidth,
 						costWidth,
+						providerWidth,
 						intelligenceWidth,
 						perfWidth,
 						perfMode,

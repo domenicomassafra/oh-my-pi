@@ -28,7 +28,12 @@ import {
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
 import type { ModelRegistry } from "../../config/model-registry";
-import { type ModelRoleLookup, type ResolvedModelRoleValue, resolveModelRoleValue } from "../../config/model-resolver";
+import {
+	filterAvailableModelsByEnabledPatterns,
+	type ModelRoleLookup,
+	type ResolvedModelRoleValue,
+	resolveModelRoleValue,
+} from "../../config/model-resolver";
 import { getKnownRoleIds, getRoleInfo } from "../../config/model-roles";
 import type { Settings } from "../../config/settings";
 import { AUTO_THINKING, type ConfiguredThinkingLevel, getConfiguredThinkingLevelMetadata } from "../../thinking";
@@ -36,6 +41,8 @@ import { theme } from "../theme/theme";
 import { matchesSelectCancel, matchesSelectDown, matchesSelectUp } from "../utils/keybinding-matchers";
 import {
 	buildBrowserItems,
+	modelBrowserSearchText,
+	modelProviderDisplayName,
 	ModelBrowser,
 	type ModelBrowserItem,
 	type RoleAssignments,
@@ -334,7 +341,11 @@ export class ModelHubComponent implements Component {
 			this.#configError = loadError ? String(loadError) : undefined;
 			allModels = this.#registry.getAll();
 			try {
-				availableModels = this.#registry.getAvailable();
+				availableModels = filterAvailableModelsByEnabledPatterns(
+					this.#registry.getAvailable(),
+					this.#settings.get("enabledModels"),
+					this.#settings,
+				);
 			} catch (error) {
 				this.#configError = error instanceof Error ? error.message : String(error);
 				availableModels = [];
@@ -421,7 +432,7 @@ export class ModelHubComponent implements Component {
 		const providerEntry = (providerId: string, isLocked: boolean): SidebarEntry => ({
 			id: `provider:${providerId}`,
 			kind: "provider",
-			label: providerId,
+			label: modelProviderDisplayName(providerId),
 			providerId,
 			locked: isLocked,
 			annotation: isLocked ? undefined : String(availableCounts.get(providerId) ?? 0),
@@ -655,7 +666,7 @@ export class ModelHubComponent implements Component {
 			this.#composeEntries();
 			return;
 		}
-		const matches = fuzzyFilter(this.#availableItems, query, ({ provider, id }) => `${provider}/${id}`);
+		const matches = fuzzyFilter(this.#availableItems, query, modelBrowserSearchText);
 		const counts = new Map<string, number>();
 		for (const item of matches) {
 			counts.set(item.provider, (counts.get(item.provider) ?? 0) + 1);
@@ -1881,7 +1892,8 @@ export class ModelHubComponent implements Component {
 			if (assignment && !assignment.autoSelected) {
 				dot = theme.fg(info.color ?? "muted", theme.status.enabled);
 				tagStyled = theme.fg(info.color ?? "muted", tag);
-				value = `${theme.fg("dim", `${assignment.model.provider}/`)}${selected ? theme.fg("accent", assignment.model.id) : assignment.model.id}`;
+				const modelName = assignment.model.name || assignment.model.id;
+				value = `${theme.fg("dim", `${modelProviderDisplayName(assignment.model.provider)} · `)}${selected ? theme.fg("accent", modelName) : modelName}`;
 				const glyph = thinkingLevelGlyph(assignment.thinkingLevel);
 				const label = getConfiguredThinkingLevelMetadata(assignment.thinkingLevel).label;
 				if (assignment.thinkingLevel !== ThinkingLevel.Inherit) {
@@ -1890,7 +1902,10 @@ export class ModelHubComponent implements Component {
 			} else if (assignment) {
 				dot = theme.fg("dim", theme.status.shadowed);
 				tagStyled = theme.fg("dim", tag);
-				value = theme.fg("dim", `auto → ${assignment.model.provider}/${assignment.model.id}`);
+				value = theme.fg(
+					"dim",
+					`auto → ${assignment.model.name || assignment.model.id} · ${modelProviderDisplayName(assignment.model.provider)}`,
+				);
 			} else {
 				dot = theme.fg("dim", theme.status.shadowed);
 				tagStyled = theme.fg("dim", tag);
@@ -1975,7 +1990,7 @@ export class ModelHubComponent implements Component {
 			for (const model of preview) {
 				if (model.provider !== entry.providerId) continue;
 				if (lines.length >= rows) break;
-				lines.push(truncateToWidth(theme.fg("dim", `    ${model.id}`), width));
+				lines.push(truncateToWidth(theme.fg("dim", `    ${model.name || model.id}`), width));
 			}
 		}
 		while (lines.length < rows) lines.push("");
@@ -2044,8 +2059,8 @@ export class ModelHubComponent implements Component {
 
 		const prefix =
 			strip.kind === "role"
-				? `${theme.fg("accent", strip.item.id)}${theme.fg("dim", " →")} `
-				: `${theme.fg(getRoleInfo(strip.role ?? "", this.#settings).color ?? "muted", (getRoleInfo(strip.role ?? "", this.#settings).tag ?? strip.role ?? "").toLowerCase())}${theme.fg("dim", ` · ${strip.item.id} →`)} `;
+				? `${theme.fg("accent", strip.item.model.name || strip.item.id)}${theme.fg("dim", " →")} `
+				: `${theme.fg(getRoleInfo(strip.role ?? "", this.#settings).color ?? "muted", (getRoleInfo(strip.role ?? "", this.#settings).tag ?? strip.role ?? "").toLowerCase())}${theme.fg("dim", ` · ${strip.item.model.name || strip.item.id} →`)} `;
 
 		// Horizontal window: once the strip overflows, drop leading chips behind
 		// a dim ellipsis so the selected chip (plus one chip of lookahead when it
